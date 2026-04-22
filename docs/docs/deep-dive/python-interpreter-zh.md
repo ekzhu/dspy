@@ -145,3 +145,186 @@ def lookup(fruit: str):
 | 适用场景 | 本地轻量、快速迭代 | 需要完整 CPython、自托管 | 托管产品、无运维 |
 
 DSPy 的选择偏向 **零基础设施 + 强隔离**，代价是 Pyodide 无法 `pip install` 任意带 C 扩展的包。
+
+## 9. 备选方案：Pydantic Monty
+
+[Pydantic Monty](https://github.com/pydantic/monty) 是 Pydantic 团队 2026 年初开源的一个 **用 Rust 从零实现的 Python 解释器**，专门为运行 LLM 生成的代码而设计。它不是嵌入 CPython，也不是 WASM，而是在 Python 进程内以 Rust 扩展（PyO3）的形式直接跑。
+
+### 为什么吸引人
+
+| 指标 | Pyodide (DSPy 现状) | Monty |
+|------|---------------------|-------|
+| 冷启动 | 几百毫秒 | **~0.06 ms** |
+| 进程数 | Python + Deno 子进程 + WASM | **同进程** |
+| 安装体积 | 需装 Deno（~80 MB） | `pip install pydantic-monty`（~4.5 MB） |
+| 工具回调 | JSON-RPC + 动态 stub | **原生 `external_functions` 字典** |
+| 状态快照 | 无 | **可序列化恢复** |
+
+Monty 的工具调用模型更优雅：沙箱代码调用 `external_functions` 里的函数时，**解释器挂起**并交出一个 `FunctionSnapshot`，宿主执行真正的函数后调用 `resume(value)` 恢复。没有 JSON-RPC、没有管道、没有 stub 代码生成 —— 本质上是 Rust 层的协作式 suspend/resume。
+
+典型 API：
+
+```python
+import pydantic_monty
+
+async def call_llm(prompt: str) -> str:
+    ...  # 宿主 Python 函数
+
+m = pydantic_monty.Monty(code, inputs=['prompt'])
+output = await m.run_async(
+    inputs={'prompt': 'testing'},
+    external_functions={'call_llm': call_llm},
+)
+```
+
+### 致命限制（截至 v0.0.3）
+
+Monty 是自研解释器，目前 **只支持 Python 的一个子集**：
+
+- **不支持** `class` 定义、`with` 上下文管理器、`match`、生成器
+- **不支持** 任何第三方库（没有 `numpy`、`pandas`、`requests`）
+- **标准库极少**：仅 `sys`、`os`、`typing`、`asyncio`、`re`、`datetime`、`json`
+- 连内置也不完整：`sorted(key=...)` 不支持
+
+而 `dspy.RLM` 的核心场景恰恰是让 LLM **写 Python 去切片分析长文本** —— LLM 习惯性地写 `with open(...)`、`@dataclass`、`pd.DataFrame`，这些 Monty 目前都跑不了。
+
+另外，全新解释器意味着 **未知的攻击面**（Pydantic 自己开了 $5000 的 bug bounty 来找逃逸漏洞），这也是采用时需要权衡的风险。
+
+### 建议
+
+**不适合做 Pyodide 的直接替代**，但可以作为 `CodeInterpreter` 协议的 **可选后端**（`dspy/primitives/code_interpreter.py` 已经是抽象接口）：
+
+- **适合**：高并发、代码片段短的 agent 服务；无法装 Deno 的 serverless 环境；纯结构化的 tool 编排。
+- **不适合**：需要 numpy/pandas 的数据分析；带 class、with、生成器的"真实" Python 代码。
+
+先例：pydantic-ai [PR #4153](https://github.com/pydantic/pydantic-ai/pull/4153) 做过完全相同的抽象，把 Monty、Docker、Local、Memory 并列为可选 `ExecutionEnvironment`，让用户自己挑。DSPy 可以沿用这个思路：默认保留 `PythonInterpreter`（Pyodide），新增 `MontyInterpreter` 作为 opt-in。
+
+## 10. 基于 Docker 的实现思路
+
+如果要让 DSPy 支持一个 **完整 CPython + 完整生态** 的后端，Docker 是最直接的选择。关键是如何保持宿主回调这个核心特性 —— 这在 E2B 这类服务里都是需要自建的。下面是实现这个后端的设计要点。
+
+### 关键挑战：双向通信
+
+Docker 容器和宿主跨进程（通常也跨网络命名空间）。要让容器内代码能调用宿主函数，必须有一条 **容器 → 宿主** 的反向通道。几种可选方案：
+
+| 方案 | 传输 | 优点 | 缺点 |
+|------|------|------|------|
+| **stdin/stdout**（类似 Deno 方案） | `docker run -i` 挂管道 | 与现有协议同构，改动最小 | 只能一条管道并发受限；容器崩溃难诊断 |
+| **Unix domain socket**（挂载到容器） | `-v /host/sock:/sandbox/sock` | 低延迟；明确的 endpoint | 需要额外的守护；权限/所有权问题 |
+| **HTTP + 容器网络** | 宿主起 HTTP 服务，容器 `requests.post` | 标准、易调试 | 要管理端口、认证；有网络栈开销 |
+| **gRPC** | 同上 | 强类型、双向流 | 依赖重 |
+
+推荐 **stdin/stdout**：可以直接复用现在 `runner.js` 那套 JSON-RPC 协议，语义完全一致，只是把 Deno 子进程换成 Docker 子进程。
+
+### 参考架构
+
+```
+┌─────────────────────────────┐
+│ 宿主 Python 进程              │
+│  - 用户工具函数               │
+│  - DockerInterpreter         │
+└───────────┬─────────────────┘
+            │ stdin/stdout（JSON-RPC 2.0）
+            │ docker run -i --rm --network=none ...
+┌───────────▼─────────────────┐
+│ Docker 容器                  │
+│  ├─ runner.py（宿主提供）    │ ← 镜像里预装
+│  │   - 读取 stdin JSON-RPC   │
+│  │   - 动态生成 tool stub    │
+│  │   - exec() 用户代码       │
+│  └─ CPython + 预装依赖       │
+└─────────────────────────────┘
+```
+
+容器镜像里预装一个 `runner.py`，职责和 `runner.js` 对等：
+
+1. 从 stdin 读 JSON-RPC 请求
+2. 收到 `register` 时在全局命名空间里 `exec()` 一段生成的 stub（见下）
+3. 收到 `execute` 时 `exec(code, globals_dict)`
+4. stub 内通过 stdout 发 `tool_call` 请求，然后 **阻塞读 stdin** 等响应
+
+### Tool stub 在容器内的样子
+
+容器内是真正的 CPython，不需要 Pyodide 的 `run_sync` 把戏。直接用同步 I/O：
+
+```python
+# 容器内，由 runner.py 通过 exec() 注入
+import json, sys, uuid
+
+def _call_host_tool(name, kwargs):
+    req_id = f"tc_{uuid.uuid4().hex}"
+    sys.stdout.write(json.dumps({
+        "jsonrpc": "2.0", "method": "tool_call",
+        "params": {"name": name, "kwargs": kwargs},
+        "id": req_id,
+    }) + "\n")
+    sys.stdout.flush()
+    # 同步等响应
+    line = sys.stdin.readline()
+    resp = json.loads(line)
+    if resp.get("id") != req_id:
+        raise RuntimeError("tool bridge id mismatch")
+    if "error" in resp:
+        raise RuntimeError(resp["error"]["message"])
+    return resp["result"]["value"]
+
+def lookup(fruit: str):
+    return _call_host_tool("lookup", {"fruit": fruit})
+```
+
+比 Pyodide 那套还简单 —— 没有 WASM FFI、没有 `run_sync`，就是普通 Python 读写两条管道。
+
+### 安全隔离
+
+Docker 层的沙箱配置是重点，推荐默认值：
+
+```bash
+docker run -i --rm \
+  --network=none \                       # 默认禁网
+  --read-only \                          # 只读根文件系统
+  --tmpfs /tmp:size=100m \               # 只给少量可写空间
+  --memory=512m --cpus=1.0 \             # 资源上限
+  --pids-limit=128 \                     # 防 fork 炸弹
+  --security-opt=no-new-privileges \     # 禁止 setuid 提权
+  --cap-drop=ALL \                       # 丢掉所有 Linux capabilities
+  dspy-sandbox:latest
+```
+
+进阶加固：
+
+- **gVisor / Kata Containers**：把内核攻击面也隔掉，代价是启动更慢
+- **seccomp profile**：只允许 Python 运行必需的 syscall 白名单
+- **rootless Docker**：host 侧 uid 隔离
+
+白名单机制和当前 `PythonInterpreter` 的 `enable_network_access` / `enable_read_paths` 对齐：默认禁用，按需 `--network=host` 或 `-v` 挂载放行。
+
+### 状态和启动成本
+
+Docker 方案有两种模式：
+
+1. **一次性容器**（每次 `execute` 新启一个）：最干净，但冷启动 1–3 秒
+2. **长连接容器**（容器里跑一个 REPL，多次 `execute` 共用）：类似 Jupyter 内核，状态跨调用保留，冷启动只付一次
+
+对 `dspy.RLM` 这种迭代式的执行循环，**长连接模式** 更合适。需要额外处理：
+
+- 容器健康检查（进程死了要自动重启）
+- 超时控制（单次 `execute` 跑太久要能 kill）
+- 并发隔离（每个 `RLM` 实例一个容器，或池化）
+
+### 实现清单
+
+如果真要在 DSPy 里加一个 `DockerInterpreter`，大致工作量：
+
+1. 实现 `dspy/primitives/docker_interpreter.py`，实现 `CodeInterpreter` 协议（`__init__` / `execute` / `shutdown`）
+2. 写 `dspy/primitives/docker_runner.py`，打进 `dspy-sandbox:<version>` 镜像，推到 Docker Hub 或让用户自己 build
+3. 协议完全复用 `python_interpreter.py` 里的 `_jsonrpc_*` helper —— 消息格式保持一致，这样 `CodeInterpreter` 协议层的调用方不用区分后端
+4. 加参数：`image`、`memory_limit`、`cpu_limit`、`network`、`reuse_container`、`docker_command`（类比 `deno_command`）
+5. 测试：与现有 Pyodide 测试共享一批用例（工具调用、变量注入、错误传播），外加 Docker 特有的资源限制测试
+
+### 何时选 Docker 方案
+
+- 用户需要 `numpy`、`pandas`、`scikit-learn` 甚至自定义 `pip install`
+- 需要严格的 CPU / 内存 / PID 配额（生产环境多租户）
+- LLM 生成的代码会用到 Pyodide 跑不动的模式（C 扩展、子进程、完整 stdlib）
+
+**不值得** 的场景：本地开发、单用户 notebook、代码片段简短 —— 这些情况 Pyodide 更轻量，或者 Monty 更快。
