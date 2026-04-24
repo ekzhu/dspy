@@ -8,54 +8,55 @@ The sandbox is where **LLM-authored logic** runs. It is *not* where every tool's
 
 The contrast that matters: **ReAct** has the LLM emit one tool call at a time and round-trips through the model between every action. **CodeAct** has the LLM emit a program; many tool calls execute *inside* one code execution before the model is asked again.
 
-```mermaid
-flowchart LR
-    subgraph React["REACT AGENT — one tool call per turn"]
-        direction TB
-        Ru((User))
-        subgraph Rh["HOST PROCESS"]
-            direction TB
-            Rl["Agent Loop<br/>(LLM driver)"]
-            Rr["Tool Router"]
-            Rl <-->|"tool_call ↕ result"| Rr
-        end
-        subgraph Rt["TOOLS"]
-            direction LR
-            Rloc["Host-local function"]
-            Rmcp["MCP server"]
-        end
-        Ru -->|"task"| Rl
-        Rr --> Rloc
-        Rr --> Rmcp
-        Rl -->|"final answer"| Ru
-    end
+**ReAct** — one tool call per turn, no sandbox:
 
-    subgraph CodeAct["CODEACT AGENT — code as the action"]
+```mermaid
+flowchart TB
+    Ru((User))
+    subgraph Rh["HOST PROCESS"]
         direction TB
-        Cu((User))
-        subgraph Ch["HOST PROCESS"]
-            direction TB
-            Cl["Agent Loop<br/>(LLM driver)"]
-            Cr["Tool Router<br/>owns: credentials, sessions,<br/>connection pools, handle IDs"]
-        end
-        subgraph Cs["CODE EXECUTION SANDBOX<br/>WASM (Pyodide) · Docker · microVM · Monty"]
-            direction TB
-            Cc["LLM-authored code"]
-            Cstub["Generated tool stubs"]
-            Cc -.->|"calls"| Cstub
-        end
-        subgraph Ct["TOOLS"]
-            direction LR
-            Cloc["Host-local function"]
-            Cmcp["MCP server"]
-        end
-        Cu -->|"task"| Cl
-        Cl <==>|"code ↕ result"| Cc
-        Cstub <==>|"FFI / JSON-RPC<br/>(stdio · socket · HTTP)"| Cr
-        Cr --> Cloc
-        Cr --> Cmcp
-        Cl -->|"final answer"| Cu
+        Rl["Agent Loop<br/>(LLM driver)"]
+        Rr["Tool Router"]
+        Rl <-->|"tool_call ↕ result"| Rr
     end
+    subgraph Rt["TOOLS"]
+        direction LR
+        Rloc["Host-local function"]
+        Rmcp["MCP server"]
+    end
+    Ru -->|"task"| Rl
+    Rr --> Rloc
+    Rr --> Rmcp
+    Rl -->|"final answer"| Ru
+```
+
+**CodeAct** — code as the action, sandboxed execution with FFI back to host:
+
+```mermaid
+flowchart TB
+    Cu((User))
+    subgraph Ch["HOST PROCESS"]
+        direction TB
+        Cl["Agent Loop<br/>(LLM driver)"]
+        Cr["Tool Router<br/>owns: credentials, sessions,<br/>connection pools, handle IDs"]
+    end
+    subgraph Cs["CODE EXECUTION SANDBOX<br/>WASM (Pyodide) · Docker · microVM · Monty"]
+        direction TB
+        Cc["LLM-authored code"]
+        Cstub["Generated tool stubs"]
+        Cc -.->|"calls"| Cstub
+    end
+    subgraph Ct["TOOLS"]
+        direction LR
+        Cloc["Host-local function"]
+        Cmcp["MCP server"]
+    end
+    Cu -->|"task"| Cl
+    Cl <==>|"code ↕ result"| Cc
+    Cstub <==>|"FFI / JSON-RPC<br/>(stdio · socket · HTTP)"| Cr
+    Cr --> Cloc
+    Cr --> Cmcp
+    Cl -->|"final answer"| Cu
 ```
 
 The two agents differ in **where actions originate** and **how often the LLM is invoked**:
